@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
 import trimesh
@@ -7,15 +8,22 @@ import uuid
 
 app = FastAPI()
 
+# ✅ CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # For testing. Replace with your Wix domain later.
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ----- CONFIG -----
 MATERIAL_COST_PER_CM3 = 0.35  # $ per cm³
 BASE_FEE = 3.00               # flat fee
 # -------------------
 
-
 class FileRequest(BaseModel):
     fileUrl: str
-
 
 @app.post("/analyze")
 def analyze_stl(file_request: FileRequest):
