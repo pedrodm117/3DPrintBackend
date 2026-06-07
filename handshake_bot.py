@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -135,41 +136,19 @@ class HandshakeBot:
     # Auth
     # ------------------------------------------------------------------
 
-    async def _try_restore_session(self, page: Page) -> bool:
-        """Load saved cookies and check if the session is still valid."""
-        if not SESSION_FILE.exists():
-            return False
-        try:
-            with open(SESSION_FILE) as f:
-                cookies = json.load(f)
-            await page.context.add_cookies(cookies)
-            await page.goto(JOBS_URL, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2000)
-            if "sign_in" not in page.url and "login" not in page.url and HANDSHAKE_BASE in page.url:
-                logger.info("Restored saved session — skipping login.")
-                return True
-            logger.info("Saved session expired, logging in again.")
-            SESSION_FILE.unlink(missing_ok=True)
-        except Exception as exc:
-            logger.debug(f"Session restore failed: {exc}")
-        return False
-
-    async def _save_session(self, page: Page) -> None:
-        """Persist browser cookies so the next run skips login."""
-        try:
-            cookies = await page.context.cookies()
-            with open(SESSION_FILE, "w") as f:
-                json.dump(cookies, f)
-            logger.info("Session saved — next run will skip login.")
-        except Exception as exc:
-            logger.debug(f"Could not save session: {exc}")
-
     async def _login(self, page: Page) -> None:
-        # Try reusing a saved session first
-        if await self._try_restore_session(page):
+        AUTH_PATHS = {"access", "sign_in", "login", "users", "sso", "auth"}
+
+        # First check if the Chrome profile is already logged into Handshake
+        await page.goto(JOBS_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+        url = page.url
+        path = url.replace(HANDSHAKE_BASE, "").lstrip("/").split("/")[0]
+        if HANDSHAKE_BASE in url and path not in AUTH_PATHS and path != "":
+            logger.info("Already logged in via Chrome profile.")
             return
 
-        logger.info("Navigating to Handshake login...")
+        # Not logged in — navigate to login and wait for the user
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
         print("\n" + "=" * 55)
@@ -177,13 +156,10 @@ class HandshakeBot:
         print("  1. Enter your email and submit")
         print("  2. Complete your university SSO")
         print("  3. Approve the Duo Mobile 2FA request")
-        print("  The bot will wait here — it will NOT touch the page.")
+        print("  The bot will continue automatically once logged in.")
         print("=" * 55 + "\n")
 
-        # Passively poll the URL from Python every 3 seconds.
-        # No JavaScript is injected into the page during this wait.
-        AUTH_PATHS = {"access", "sign_in", "login", "users", "sso", "auth"}
-        deadline = asyncio.get_event_loop().time() + 300  # 5-minute window
+        deadline = asyncio.get_event_loop().time() + 300
         while asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(3)
             try:
@@ -194,12 +170,9 @@ class HandshakeBot:
             except Exception:
                 continue
         else:
-            raise RuntimeError(
-                "Timed out waiting for login (5 minutes). Please try again."
-            )
+            raise RuntimeError("Timed out waiting for login (5 minutes). Please try again.")
 
         logger.info("Logged in successfully.")
-        await self._save_session(page)
 
     # ------------------------------------------------------------------
     # Search
@@ -349,14 +322,24 @@ class HandshakeBot:
     # ------------------------------------------------------------------
 
     async def run(self) -> list:
+        # Default Chrome profile path on Windows; override via config if needed
+        default_profile = os.path.join(
+            os.environ.get("LOCALAPPDATA", ""),
+            "Google", "Chrome", "User Data"
+        )
+        chrome_profile = self.config.get("settings", {}).get(
+            "chrome_profile_path", default_profile
+        )
+
         async with async_playwright() as pw:
-            # Use the real Chrome installation instead of Playwright's Chromium.
-            # This bypasses bot detection since Handshake sees a genuine Chrome browser.
-            browser = await pw.chromium.launch(
+            # Launch Chrome using the user's real profile so Handshake sees
+            # a genuine browser with existing cookies and history.
+            # Chrome must be fully closed before running this script.
+            context = await pw.chromium.launch_persistent_context(
+                user_data_dir=chrome_profile,
                 channel="chrome",
-                headless=False,  # required when using real Chrome
-            )
-            context = await browser.new_context(
+                headless=False,
+                args=["--profile-directory=Default"],
                 viewport={"width": 1280, "height": 800},
             )
             await context.add_init_script(
@@ -430,7 +413,7 @@ class HandshakeBot:
                             await asyncio.sleep(self.delay)
 
             finally:
-                await browser.close()
+                await context.close()
 
         applied = sum(1 for r in self.session_results if r["status"] == "applied")
         skipped = sum(1 for r in self.session_results if r["status"].startswith("skipped"))

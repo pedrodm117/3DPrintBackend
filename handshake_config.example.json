@@ -14,9 +14,9 @@
     "company_blocklist": []
   },
   "settings": {
-    "headless": true,
     "max_applications_per_run": 10,
     "delay_between_applications_seconds": 4,
-    "require_explicit_sponsorship": false
+    "require_explicit_sponsorship": false,
+    "chrome_profile_path": "C:\\Users\\YOUR_USERNAME\\AppData\\Local\\Google\\Chrome\\User Data"
   }
 }
