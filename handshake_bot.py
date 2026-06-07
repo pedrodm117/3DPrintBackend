@@ -173,42 +173,45 @@ class HandshakeBot:
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
 
-        # Fill in the email to let Handshake decide direct vs SSO
-        email_input = page.locator(
-            'input[type="email"], input[name="email"], input[placeholder*="email" i]'
-        ).first
-        await email_input.wait_for(state="visible", timeout=10000)
-        await email_input.fill(self.email)
-        await email_input.press("Enter")
-        await page.wait_for_timeout(3000)
+        # Pre-fill the email to save the user one step, then stop touching the page
+        try:
+            email_input = page.locator(
+                'input[type="email"], input[name="email"], input[placeholder*="email" i]'
+            ).first
+            if await email_input.is_visible(timeout=3000):
+                await email_input.fill(self.email)
+        except Exception:
+            pass
 
-        # Detect SSO redirect (URL leaves joinhandshake.com)
-        if HANDSHAKE_BASE not in page.url:
-            print("\n" + "=" * 50)
-            print("SSO LOGIN REQUIRED")
-            print("Complete the login in the Chrome window that just opened.")
-            print("The bot will continue automatically once you are logged in.")
-            print("=" * 50 + "\n")
-            # Wait up to 5 minutes for the user to complete SSO
-            try:
-                await page.wait_for_url(f"{HANDSHAKE_BASE}/**", timeout=300_000)
-            except Exception:
-                raise RuntimeError("Timed out waiting for SSO login. Please try again.")
-        else:
-            # Direct email/password login
-            password_input = page.locator('input[type="password"]').first
-            await password_input.wait_for(state="visible", timeout=10000)
-            await password_input.fill(self.password)
-            await password_input.press("Enter")
-            try:
-                await page.wait_for_url(f"{HANDSHAKE_BASE}/**", timeout=15000)
-            except Exception:
-                pass
+        print("\n" + "=" * 55)
+        print("  ACTION REQUIRED — complete login in the browser:")
+        print("  1. Submit your email (already filled in)")
+        print("  2. Complete your university SSO")
+        print("  3. Approve the Duo Mobile 2FA request")
+        print("  The bot will continue automatically once you land")
+        print("  back on Handshake. It will NOT touch the page.")
+        print("=" * 55 + "\n")
 
-        await page.wait_for_timeout(2000)
-
-        if "sign_in" in page.url or "login" in page.url:
-            raise RuntimeError(f"Login failed. Still on: {page.url}")
+        # Do nothing until the page shows a logged-in Handshake state.
+        # Checks both the URL (/stu/ path, no sign_in) and that the jobs
+        # nav link exists — this is only true after a fully completed login.
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const url = window.location.href;
+                    const loggedIn = url.includes('app.joinhandshake.com/stu') &&
+                                     !url.includes('sign_in') &&
+                                     !url.includes('/users/') &&
+                                     !url.includes('/login');
+                    const hasNav = document.querySelector('a[href*="/stu/jobs"]') !== null;
+                    return loggedIn && hasNav;
+                }""",
+                timeout=300_000,  # 5-minute window for SSO + Duo
+            )
+        except Exception:
+            raise RuntimeError(
+                "Timed out waiting for login (5 minutes). Please try again."
+            )
 
         logger.info("Logged in successfully.")
         await self._save_session(page)
