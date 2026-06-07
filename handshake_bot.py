@@ -245,9 +245,11 @@ class HandshakeBot:
                 break
 
         if not cards:
+            screenshot_path = Path("debug_jobs_page.png")
+            await page.screenshot(path=str(screenshot_path), full_page=True)
             logger.warning(
                 f"No job cards found for '{keyword}' / '{location}'. "
-                "Handshake may have updated its markup — check selectors in handshake_bot.py."
+                f"Screenshot saved to {screenshot_path.resolve()} — share this to fix selectors."
             )
             return []
 
