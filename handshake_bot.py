@@ -350,23 +350,15 @@ class HandshakeBot:
 
     async def run(self) -> list:
         async with async_playwright() as pw:
+            # Use the real Chrome installation instead of Playwright's Chromium.
+            # This bypasses bot detection since Handshake sees a genuine Chrome browser.
             browser = await pw.chromium.launch(
-                headless=self.headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
+                channel="chrome",
+                headless=False,  # required when using real Chrome
             )
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
                 viewport={"width": 1280, "height": 800},
             )
-            # Hide the webdriver flag that sites use to detect automation
             await context.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
