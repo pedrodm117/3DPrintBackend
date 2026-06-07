@@ -2,14 +2,21 @@
   "email": "your.email@university.edu",
   "password": "your_password",
   "filters": {
-    "job_keywords": ["Software Engineer", "Backend Developer", "Data Analyst"],
-    "locations": ["San Francisco, CA", "New York, NY", "Remote"],
-    "company_allowlist": [],
-    "company_blocklist": ["Company To Avoid Inc"]
+    "job_keywords": [
+      "Software Engineer",
+      "Hardware Engineer",
+      "Electrical Engineer",
+      "Mechanical Engineer",
+      "Data Engineer",
+      "Machine Learning Engineer"
+    ],
+    "locations": ["United States"],
+    "company_blocklist": []
   },
   "settings": {
     "headless": true,
     "max_applications_per_run": 10,
-    "delay_between_applications_seconds": 3
+    "delay_between_applications_seconds": 4,
+    "require_explicit_sponsorship": false
   }
 }

@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -17,6 +17,31 @@ CONFIG_FILE = Path("handshake_config.json")
 HANDSHAKE_BASE = "https://app.joinhandshake.com"
 LOGIN_URL = f"{HANDSHAKE_BASE}/stu/users/sign_in"
 JOBS_URL = f"{HANDSHAKE_BASE}/stu/jobs"
+
+# Phrases that confirm visa sponsorship is offered
+VISA_POSITIVE = [
+    r"visa sponsorship",
+    r"will sponsor",
+    r"h[\-\s]?1[\-\s]?b",
+    r"sponsorship (is |will be |)provided",
+    r"sponsor(s)? (work |employment |visa )",
+    r"work (visa|authorization) (provided|sponsored|available)",
+    r"opt[/ ]cpt",
+]
+
+# Phrases that explicitly rule out sponsorship
+VISA_NEGATIVE = [
+    r"no visa sponsorship",
+    r"not (able |)(offer|provide|sponsor|support) (visa |work |)sponsor",
+    r"cannot (offer |provide |)sponsor",
+    r"will not sponsor",
+    r"does not (offer|provide) sponsor",
+    r"sponsorship (is |)not (available|offered|provided)",
+    r"must be (legally |)(authorized|eligible) to work",
+    r"not (eligible|available) for (visa )?sponsor",
+    r"unable to sponsor",
+    r"no sponsorship",
+]
 
 
 def load_config(path: Path = CONFIG_FILE) -> dict:
@@ -56,31 +81,64 @@ class AppliedJobsTracker:
         return [{"id": k, **v} for k, v in self.data.items()]
 
 
+def _check_sponsorship_in_text(text: str) -> tuple:
+    """
+    Returns (sponsored: bool | None, reason: str).
+    None means the job description didn't mention sponsorship either way.
+    """
+    text = text.lower()
+
+    for pattern in VISA_NEGATIVE:
+        if re.search(pattern, text):
+            return False, f"no-sponsorship phrase matched: '{pattern}'"
+
+    for pattern in VISA_POSITIVE:
+        if re.search(pattern, text):
+            return True, f"sponsorship phrase matched: '{pattern}'"
+
+    return None, "sponsorship not mentioned"
+
+
 class HandshakeBot:
     def __init__(self, config: dict):
-        filters = config.get("filters", {})
         settings = config.get("settings", {})
+        filters = config.get("filters", {})
 
         self.email: str = config["email"]
         self.password: str = config["password"]
-        self.job_keywords: list = filters.get("job_keywords", [])
-        self.locations: list = filters.get("locations", [])
-        self.company_allowlist: list = [c.lower() for c in filters.get("company_allowlist", [])]
+
+        # Defaults tuned for US engineering + visa sponsorship use case
+        self.job_keywords: list = filters.get("job_keywords", [
+            "Software Engineer",
+            "Hardware Engineer",
+            "Electrical Engineer",
+            "Mechanical Engineer",
+            "Data Engineer",
+            "Machine Learning Engineer",
+        ])
+        self.locations: list = filters.get("locations", ["United States"])
         self.company_blocklist: list = [c.lower() for c in filters.get("company_blocklist", [])]
+
+        # When True, skip jobs whose description doesn't explicitly mention sponsorship.
+        # When False, only skip jobs that explicitly deny sponsorship.
+        self.require_explicit_sponsorship: bool = settings.get("require_explicit_sponsorship", False)
 
         self.headless: bool = settings.get("headless", True)
         self.max_applications: int = settings.get("max_applications_per_run", 10)
-        self.delay: float = settings.get("delay_between_applications_seconds", 3.0)
+        self.delay: float = settings.get("delay_between_applications_seconds", 4.0)
 
         self.tracker = AppliedJobsTracker()
         self.session_results: list = []
+
+    # ------------------------------------------------------------------
+    # Auth
+    # ------------------------------------------------------------------
 
     async def _login(self, page: Page) -> None:
         logger.info("Navigating to Handshake login...")
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
 
-        # Fill email — selector covers standard input and Handshake's labelled input
         email_input = page.locator(
             'input[type="email"], input[name="email"], input[placeholder*="email" i]'
         ).first
@@ -89,13 +147,11 @@ class HandshakeBot:
         await email_input.press("Enter")
         await page.wait_for_timeout(2000)
 
-        # Password may appear after the email step (email-first flow)
         password_input = page.locator('input[type="password"]').first
         await password_input.wait_for(state="visible", timeout=10000)
         await password_input.fill(self.password)
         await password_input.press("Enter")
 
-        # Wait for post-login redirect
         try:
             await page.wait_for_url(f"{HANDSHAKE_BASE}/**", timeout=15000)
         except Exception:
@@ -104,44 +160,49 @@ class HandshakeBot:
         await page.wait_for_timeout(2000)
 
         if "sign_in" in page.url or "login" in page.url:
-            err_el = page.locator('[class*="error" i], [class*="alert" i], [role="alert"]').first
             err_text = ""
             try:
-                err_text = await err_el.text_content(timeout=2000) or ""
+                err_text = await page.locator(
+                    '[class*="error" i], [class*="alert" i], [role="alert"]'
+                ).first.text_content(timeout=2000) or ""
             except Exception:
                 pass
             raise RuntimeError(
-                f"Login failed. URL still: {page.url}. "
-                f"Page error: {err_text.strip() or 'none detected'}. "
+                f"Login failed. URL still at: {page.url}. "
+                f"Page says: '{err_text.strip() or 'no error text detected'}'. "
                 "Check your credentials in handshake_config.json."
             )
 
         logger.info("Logged in successfully.")
 
-    def _passes_filters(self, title: str, company: str, job_id: str) -> tuple:
-        if self.tracker.has_applied(job_id):
-            return False, "already applied"
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
 
-        company_lower = company.lower()
+    async def _apply_sponsorship_filter(self, page: Page) -> None:
+        """Try to activate Handshake's built-in visa sponsorship filter."""
+        try:
+            # Handshake may render a "Visa Sponsorship" checkbox in the filters panel
+            sponsorship_checkbox = page.locator(
+                'label:has-text("Visa Sponsorship"), '
+                'label:has-text("visa sponsorship"), '
+                '[data-hook*="sponsorship"], '
+                'input[value*="sponsorship" i]'
+            ).first
+            if await sponsorship_checkbox.is_visible(timeout=3000):
+                await sponsorship_checkbox.click()
+                await page.wait_for_timeout(1500)
+                logger.info("Activated Handshake visa sponsorship filter.")
+        except Exception:
+            pass  # Filter not found — we'll check descriptions ourselves
 
-        if self.company_blocklist and any(bl in company_lower for bl in self.company_blocklist):
-            return False, f"'{company}' is blocklisted"
-
-        if self.company_allowlist and not any(al in company_lower for al in self.company_allowlist):
-            return False, f"'{company}' not in allowlist"
-
-        return True, "ok"
-
-    async def _search_jobs(self, page: Page, keyword: str, location: Optional[str]) -> list:
-        params = {"query": keyword}
-        if location:
-            params["location"] = location
-        qs = "&".join(f"{k}={v}" for k, v in params.items())
-
+    async def _search_jobs(self, page: Page, keyword: str, location: str) -> list:
+        qs = f"query={keyword}&location={location}"
         await page.goto(f"{JOBS_URL}?{qs}", wait_until="domcontentloaded")
         await page.wait_for_timeout(3000)
 
-        # Try multiple selector strategies — Handshake's class names can change
+        await self._apply_sponsorship_filter(page)
+
         cards = []
         for selector in [
             '[data-hook="jobs-card"]',
@@ -155,8 +216,8 @@ class HandshakeBot:
 
         if not cards:
             logger.warning(
-                f"No job cards found for '{keyword}'. "
-                "Handshake may have changed its markup — check selectors in handshake_bot.py."
+                f"No job cards found for '{keyword}' / '{location}'. "
+                "Handshake may have updated its markup — check selectors in handshake_bot.py."
             )
             return []
 
@@ -171,8 +232,7 @@ class HandshakeBot:
                 full_url = f"{HANDSHAKE_BASE}{href}" if href.startswith("/") else href
                 job_id = href.split("/")[-1].split("?")[0]
 
-                text = await card.inner_text()
-                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                lines = [ln.strip() for ln in (await card.inner_text()).splitlines() if ln.strip()]
                 title = lines[0] if lines else "Unknown"
                 company = lines[1] if len(lines) > 1 else "Unknown"
 
@@ -180,11 +240,28 @@ class HandshakeBot:
             except Exception as exc:
                 logger.debug(f"Error parsing card: {exc}")
 
-        label = f"'{keyword}'" + (f" in '{location}'" if location else "")
-        logger.info(f"Found {len(jobs)} jobs for {label}")
+        logger.info(f"Found {len(jobs)} jobs for '{keyword}' in '{location}'")
         return jobs
 
-    async def _apply(self, page: Page, job: dict) -> dict:
+    # ------------------------------------------------------------------
+    # Sponsorship check
+    # ------------------------------------------------------------------
+
+    async def _get_job_description_text(self, page: Page, job_url: str) -> str:
+        """Navigate to the job page and return all visible text."""
+        await page.goto(job_url, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+        return await page.locator("body").inner_text()
+
+    # ------------------------------------------------------------------
+    # Application
+    # ------------------------------------------------------------------
+
+    async def _submit_application(self, page: Page, job: dict) -> dict:
+        """
+        Assumes we are already on the job detail page.
+        Clicks Apply and handles Quick Apply if available.
+        """
         result = {
             "job_id": job["id"],
             "title": job["title"],
@@ -194,53 +271,56 @@ class HandshakeBot:
             "timestamp": datetime.now().isoformat(),
         }
 
+        apply_btn = page.locator(
+            'button:has-text("Apply"), a:has-text("Apply"), '
+            '[data-hook*="apply" i], button[class*="apply" i]'
+        ).first
+
         try:
-            await page.goto(job["url"], wait_until="domcontentloaded")
+            await apply_btn.wait_for(state="visible", timeout=5000)
+        except Exception:
+            result["status"] = "no_apply_button"
+            return result
+
+        await apply_btn.click()
+        await page.wait_for_timeout(2000)
+
+        # Detect redirect to external company ATS
+        if HANDSHAKE_BASE not in page.url:
+            result["status"] = "external_redirect"
+            result["external_url"] = page.url
+            logger.info(f"External ATS for '{job['title']}': {page.url}")
+            return result
+
+        # Quick Apply modal
+        submit_btn = page.locator(
+            'button:has-text("Submit"), button:has-text("Confirm"), '
+            'button:has-text("Send Application"), button[type="submit"]'
+        ).first
+
+        try:
+            await submit_btn.wait_for(state="visible", timeout=4000)
+            await submit_btn.click()
             await page.wait_for_timeout(2000)
-
-            apply_btn = page.locator(
-                'button:has-text("Apply"), a:has-text("Apply"), '
-                '[data-hook*="apply" i], button[class*="apply" i]'
-            ).first
-
-            try:
-                await apply_btn.wait_for(state="visible", timeout=5000)
-            except Exception:
-                result["status"] = "no_apply_button"
-                return result
-
-            await apply_btn.click()
-            await page.wait_for_timeout(2000)
-
-            # Detect redirect to external company ATS
-            if HANDSHAKE_BASE not in page.url:
-                result["status"] = "external_redirect"
-                result["external_url"] = page.url
-                logger.info(f"External ATS for '{job['title']}': {page.url}")
-                return result
-
-            # Quick Apply modal — look for a submit/confirm button
-            submit_btn = page.locator(
-                'button:has-text("Submit"), button:has-text("Confirm"), '
-                'button:has-text("Send Application"), button[type="submit"]'
-            ).first
-
-            try:
-                await submit_btn.wait_for(state="visible", timeout=4000)
-                await submit_btn.click()
-                await page.wait_for_timeout(2000)
-                result["status"] = "applied"
-                logger.info(f"Applied: '{job['title']}' at '{job['company']}'")
-            except Exception:
-                result["status"] = "form_required"
-                logger.info(f"Manual form required: '{job['title']}'")
-
-        except Exception as exc:
-            result["status"] = "error"
-            result["error"] = str(exc)
-            logger.exception(f"Error applying to '{job['title']}': {exc}")
+            result["status"] = "applied"
+            logger.info(f"Applied: '{job['title']}' at '{job['company']}'")
+        except Exception:
+            result["status"] = "form_required"
+            logger.info(f"Manual form required: '{job['title']}'")
 
         return result
+
+    # ------------------------------------------------------------------
+    # Pre-application checks
+    # ------------------------------------------------------------------
+
+    def _blocked_company(self, company: str) -> bool:
+        cl = company.lower()
+        return any(bl in cl for bl in self.company_blocklist)
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
     async def run(self) -> list:
         async with async_playwright() as pw:
@@ -259,12 +339,12 @@ class HandshakeBot:
                 await self._login(page)
 
                 sent = 0
-                search_locations = self.locations if self.locations else [None]
 
                 for keyword in self.job_keywords:
                     if sent >= self.max_applications:
                         break
-                    for location in search_locations:
+
+                    for location in self.locations:
                         if sent >= self.max_applications:
                             break
 
@@ -274,12 +354,44 @@ class HandshakeBot:
                             if sent >= self.max_applications:
                                 break
 
-                            ok, reason = self._passes_filters(job["title"], job["company"], job["id"])
-                            if not ok:
-                                logger.info(f"Skipping '{job['title']}' ({reason})")
+                            if self.tracker.has_applied(job["id"]):
+                                logger.info(f"Already applied — skipping '{job['title']}'")
                                 continue
 
-                            result = await self._apply(page, job)
+                            if self._blocked_company(job["company"]):
+                                logger.info(f"Blocklisted company — skipping '{job['company']}'")
+                                continue
+
+                            # Load job page and check visa sponsorship in description
+                            body_text = await self._get_job_description_text(page, job["url"])
+                            sponsored, reason = _check_sponsorship_in_text(body_text)
+
+                            if sponsored is False:
+                                logger.info(f"No sponsorship — skipping '{job['title']}': {reason}")
+                                self.session_results.append({
+                                    **job,
+                                    "status": "skipped_no_sponsorship",
+                                    "reason": reason,
+                                    "timestamp": datetime.now().isoformat(),
+                                })
+                                continue
+
+                            if sponsored is None and self.require_explicit_sponsorship:
+                                logger.info(f"Sponsorship unclear — skipping '{job['title']}': {reason}")
+                                self.session_results.append({
+                                    **job,
+                                    "status": "skipped_sponsorship_unclear",
+                                    "reason": reason,
+                                    "timestamp": datetime.now().isoformat(),
+                                })
+                                continue
+
+                            if sponsored is None:
+                                logger.info(f"Sponsorship not mentioned — proceeding with '{job['title']}'")
+
+                            # Apply (we're already on the job page from the sponsorship check)
+                            result = await self._submit_application(page, job)
+                            result["sponsorship_check"] = reason
                             self.session_results.append(result)
 
                             if result["status"] == "applied":
@@ -291,8 +403,9 @@ class HandshakeBot:
             finally:
                 await browser.close()
 
-        applied_count = sum(1 for r in self.session_results if r["status"] == "applied")
-        logger.info(f"Session done. Applied to {applied_count} job(s).")
+        applied = sum(1 for r in self.session_results if r["status"] == "applied")
+        skipped = sum(1 for r in self.session_results if r["status"].startswith("skipped"))
+        logger.info(f"Session done. Applied: {applied}, skipped (no sponsorship): {skipped}.")
         return self.session_results
 
 
