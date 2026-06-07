@@ -171,21 +171,10 @@ class HandshakeBot:
 
         logger.info("Navigating to Handshake login...")
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-
-        # Pre-fill the email to save the user one step, then stop touching the page
-        try:
-            email_input = page.locator(
-                'input[type="email"], input[name="email"], input[placeholder*="email" i]'
-            ).first
-            if await email_input.is_visible(timeout=3000):
-                await email_input.fill(self.email)
-        except Exception:
-            pass
 
         print("\n" + "=" * 55)
         print("  ACTION REQUIRED — complete login in the browser:")
-        print("  1. Submit your email (already filled in)")
+        print("  1. Enter your email and submit")
         print("  2. Complete your university SSO")
         print("  3. Approve the Duo Mobile 2FA request")
         print("  The bot will wait here — it will NOT touch the page.")
@@ -361,14 +350,25 @@ class HandshakeBot:
 
     async def run(self) -> list:
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=self.headless)
+            browser = await pw.chromium.launch(
+                headless=self.headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
             context = await browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
+                    "Chrome/124.0.0.0 Safari/537.36"
                 ),
                 viewport={"width": 1280, "height": 800},
+            )
+            # Hide the webdriver flag that sites use to detect automation
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
             page = await context.new_page()
 
