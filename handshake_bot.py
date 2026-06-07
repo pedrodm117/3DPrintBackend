@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 APPLIED_JOBS_FILE = Path("applied_jobs.json")
 CONFIG_FILE = Path("handshake_config.json")
+SESSION_FILE = Path("handshake_session.json")
 
 HANDSHAKE_BASE = "https://app.joinhandshake.com"
 LOGIN_URL = f"{HANDSHAKE_BASE}/stu/users/sign_in"
@@ -134,46 +135,83 @@ class HandshakeBot:
     # Auth
     # ------------------------------------------------------------------
 
+    async def _try_restore_session(self, page: Page) -> bool:
+        """Load saved cookies and check if the session is still valid."""
+        if not SESSION_FILE.exists():
+            return False
+        try:
+            with open(SESSION_FILE) as f:
+                cookies = json.load(f)
+            await page.context.add_cookies(cookies)
+            await page.goto(JOBS_URL, wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
+            if "sign_in" not in page.url and "login" not in page.url and HANDSHAKE_BASE in page.url:
+                logger.info("Restored saved session — skipping login.")
+                return True
+            logger.info("Saved session expired, logging in again.")
+            SESSION_FILE.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.debug(f"Session restore failed: {exc}")
+        return False
+
+    async def _save_session(self, page: Page) -> None:
+        """Persist browser cookies so the next run skips login."""
+        try:
+            cookies = await page.context.cookies()
+            with open(SESSION_FILE, "w") as f:
+                json.dump(cookies, f)
+            logger.info("Session saved — next run will skip login.")
+        except Exception as exc:
+            logger.debug(f"Could not save session: {exc}")
+
     async def _login(self, page: Page) -> None:
+        # Try reusing a saved session first
+        if await self._try_restore_session(page):
+            return
+
         logger.info("Navigating to Handshake login...")
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
 
+        # Fill in the email to let Handshake decide direct vs SSO
         email_input = page.locator(
             'input[type="email"], input[name="email"], input[placeholder*="email" i]'
         ).first
         await email_input.wait_for(state="visible", timeout=10000)
         await email_input.fill(self.email)
         await email_input.press("Enter")
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(3000)
 
-        password_input = page.locator('input[type="password"]').first
-        await password_input.wait_for(state="visible", timeout=10000)
-        await password_input.fill(self.password)
-        await password_input.press("Enter")
-
-        try:
-            await page.wait_for_url(f"{HANDSHAKE_BASE}/**", timeout=15000)
-        except Exception:
-            pass
+        # Detect SSO redirect (URL leaves joinhandshake.com)
+        if HANDSHAKE_BASE not in page.url:
+            print("\n" + "=" * 50)
+            print("SSO LOGIN REQUIRED")
+            print("Complete the login in the Chrome window that just opened.")
+            print("The bot will continue automatically once you are logged in.")
+            print("=" * 50 + "\n")
+            # Wait up to 5 minutes for the user to complete SSO
+            try:
+                await page.wait_for_url(f"{HANDSHAKE_BASE}/**", timeout=300_000)
+            except Exception:
+                raise RuntimeError("Timed out waiting for SSO login. Please try again.")
+        else:
+            # Direct email/password login
+            password_input = page.locator('input[type="password"]').first
+            await password_input.wait_for(state="visible", timeout=10000)
+            await password_input.fill(self.password)
+            await password_input.press("Enter")
+            try:
+                await page.wait_for_url(f"{HANDSHAKE_BASE}/**", timeout=15000)
+            except Exception:
+                pass
 
         await page.wait_for_timeout(2000)
 
         if "sign_in" in page.url or "login" in page.url:
-            err_text = ""
-            try:
-                err_text = await page.locator(
-                    '[class*="error" i], [class*="alert" i], [role="alert"]'
-                ).first.text_content(timeout=2000) or ""
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"Login failed. URL still at: {page.url}. "
-                f"Page says: '{err_text.strip() or 'no error text detected'}'. "
-                "Check your credentials in handshake_config.json."
-            )
+            raise RuntimeError(f"Login failed. Still on: {page.url}")
 
         logger.info("Logged in successfully.")
+        await self._save_session(page)
 
     # ------------------------------------------------------------------
     # Search

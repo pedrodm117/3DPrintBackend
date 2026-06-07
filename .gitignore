@@ -1,6 +1,9 @@
 # Handshake credentials — never commit
 handshake_config.json
 
+# Handshake session cookies — never commit
+handshake_session.json
+
 # Handshake application history (local state)
 applied_jobs.json
 
