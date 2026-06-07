@@ -1,0 +1,18 @@
+# Handshake credentials — never commit
+handshake_config.json
+
+# Handshake application history (local state)
+applied_jobs.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Playwright
+playwright-report/
+
+# Temp STL files
+*.stl

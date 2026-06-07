@@ -4,3 +4,4 @@ trimesh
 pydantic
 requests
 python-multipart
+playwright

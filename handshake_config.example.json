@@ -1,0 +1,15 @@
+{
+  "email": "your.email@university.edu",
+  "password": "your_password",
+  "filters": {
+    "job_keywords": ["Software Engineer", "Backend Developer", "Data Analyst"],
+    "locations": ["San Francisco, CA", "New York, NY", "Remote"],
+    "company_allowlist": [],
+    "company_blocklist": ["Company To Avoid Inc"]
+  },
+  "settings": {
+    "headless": true,
+    "max_applications_per_run": 10,
+    "delay_between_applications_seconds": 3
+  }
+}
