@@ -2,6 +2,7 @@
 handshake_config.json
 
 # Handshake session cookies — never commit
+handshake_cookies.json
 handshake_session.json
 
 # Handshake application history (local state)

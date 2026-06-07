@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -14,10 +13,9 @@ logger = logging.getLogger(__name__)
 
 APPLIED_JOBS_FILE = Path("applied_jobs.json")
 CONFIG_FILE = Path("handshake_config.json")
-SESSION_FILE = Path("handshake_session.json")
+COOKIES_FILE = Path("handshake_cookies.json")
 
 HANDSHAKE_BASE = "https://app.joinhandshake.com"
-LOGIN_URL = f"{HANDSHAKE_BASE}/access"
 JOBS_URL = f"{HANDSHAKE_BASE}/stu/jobs"
 
 # Phrases that confirm visa sponsorship is offered
@@ -56,6 +54,35 @@ def load_config(path: Path = CONFIG_FILE) -> dict:
         return json.load(f)
 
 
+def _normalize_cookies(raw: list) -> list:
+    """Convert Cookie-Editor JSON export format to Playwright's format."""
+    SAME_SITE_MAP = {
+        "no_restriction": "None",
+        "lax": "Lax",
+        "strict": "Strict",
+        "unspecified": "None",
+        "none": "None",
+    }
+    result = []
+    for c in raw:
+        domain = c.get("domain", "")
+        if "joinhandshake.com" not in domain:
+            continue
+        cookie = {
+            "name": c["name"],
+            "value": c["value"],
+            "domain": domain,
+            "path": c.get("path", "/"),
+            "httpOnly": c.get("httpOnly", False),
+            "secure": c.get("secure", False),
+            "sameSite": SAME_SITE_MAP.get(c.get("sameSite", "").lower(), "None"),
+        }
+        if "expirationDate" in c:
+            cookie["expires"] = int(c["expirationDate"])
+        result.append(cookie)
+    return result
+
+
 class AppliedJobsTracker:
     def __init__(self, path: Path = APPLIED_JOBS_FILE):
         self.path = path
@@ -89,27 +116,42 @@ def _check_sponsorship_in_text(text: str) -> tuple:
     None means the job description didn't mention sponsorship either way.
     """
     text = text.lower()
-
     for pattern in VISA_NEGATIVE:
         if re.search(pattern, text):
             return False, f"no-sponsorship phrase matched: '{pattern}'"
-
     for pattern in VISA_POSITIVE:
         if re.search(pattern, text):
             return True, f"sponsorship phrase matched: '{pattern}'"
-
     return None, "sponsorship not mentioned"
+
+
+def _print_cookie_instructions() -> None:
+    print("\n" + "=" * 62)
+    print("  SETUP REQUIRED — export your Handshake session cookies")
+    print()
+    print("  Do this once (repeat only when your session expires):")
+    print()
+    print("  1. Install the 'Cookie-Editor' extension in Chrome:")
+    print("     https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm")
+    print()
+    print("  2. In Chrome, go to https://app.joinhandshake.com and")
+    print("     make sure you are fully logged in.")
+    print()
+    print("  3. Click the Cookie-Editor toolbar icon.")
+    print("     Click  Export  →  Export as JSON")
+    print()
+    print(f"  4. Save the file as:  {(Path.cwd() / 'handshake_cookies.json').resolve()}")
+    print()
+    print("  5. Run the bot again.")
+    print("=" * 62 + "\n")
 
 
 class HandshakeBot:
     def __init__(self, config: dict):
-        settings = config.get("settings", {})
+        self.config = config
         filters = config.get("filters", {})
+        settings = config.get("settings", {})
 
-        self.email: str = config["email"]
-        self.password: str = config["password"]
-
-        # Defaults tuned for US engineering + visa sponsorship use case
         self.job_keywords: list = filters.get("job_keywords", [
             "Software Engineer",
             "Hardware Engineer",
@@ -121,11 +163,7 @@ class HandshakeBot:
         self.locations: list = filters.get("locations", ["United States"])
         self.company_blocklist: list = [c.lower() for c in filters.get("company_blocklist", [])]
 
-        # When True, skip jobs whose description doesn't explicitly mention sponsorship.
-        # When False, only skip jobs that explicitly deny sponsorship.
         self.require_explicit_sponsorship: bool = settings.get("require_explicit_sponsorship", False)
-
-        self.headless: bool = settings.get("headless", True)
         self.max_applications: int = settings.get("max_applications_per_run", 10)
         self.delay: float = settings.get("delay_between_applications_seconds", 4.0)
 
@@ -133,67 +171,60 @@ class HandshakeBot:
         self.session_results: list = []
 
     # ------------------------------------------------------------------
-    # Auth
+    # Auth — cookie-based, never visits the /access login page
     # ------------------------------------------------------------------
 
     async def _login(self, page: Page) -> None:
-        AUTH_PATHS = {"access", "sign_in", "login", "users", "sso", "auth"}
+        if not COOKIES_FILE.exists():
+            _print_cookie_instructions()
+            raise RuntimeError(
+                "handshake_cookies.json not found. "
+                "Follow the instructions above to export your cookies."
+            )
 
-        # First check if the Chrome profile is already logged into Handshake
+        with open(COOKIES_FILE) as f:
+            raw = json.load(f)
+
+        cookies = _normalize_cookies(raw)
+        if not cookies:
+            raise RuntimeError(
+                "No joinhandshake.com cookies found in handshake_cookies.json. "
+                "Make sure you exported cookies while on the Handshake site."
+            )
+
+        await page.context.add_cookies(cookies)
+
+        # Navigate directly to jobs — never touch the /access login page
         await page.goto(JOBS_URL, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
-        url = page.url
-        path = url.replace(HANDSHAKE_BASE, "").lstrip("/").split("/")[0]
-        if HANDSHAKE_BASE in url and path not in AUTH_PATHS and path != "":
-            logger.info("Already logged in via Chrome profile.")
-            return
 
-        # Not logged in — navigate to login and wait for the user
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        if "access" in page.url or "sign_in" in page.url or "login" in page.url:
+            _print_cookie_instructions()
+            raise RuntimeError(
+                "Cookies are expired or invalid — Handshake redirected to login. "
+                "Export fresh cookies and try again."
+            )
 
-        print("\n" + "=" * 55)
-        print("  ACTION REQUIRED — complete login in the browser:")
-        print("  1. Enter your email and submit")
-        print("  2. Complete your university SSO")
-        print("  3. Approve the Duo Mobile 2FA request")
-        print("  The bot will continue automatically once logged in.")
-        print("=" * 55 + "\n")
-
-        deadline = asyncio.get_event_loop().time() + 300
-        while asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(3)
-            try:
-                url = page.url
-                path = url.replace(HANDSHAKE_BASE, "").lstrip("/").split("/")[0]
-                if HANDSHAKE_BASE in url and path not in AUTH_PATHS and path != "":
-                    break
-            except Exception:
-                continue
-        else:
-            raise RuntimeError("Timed out waiting for login (5 minutes). Please try again.")
-
-        logger.info("Logged in successfully.")
+        logger.info("Loaded session cookies — logged in successfully.")
 
     # ------------------------------------------------------------------
     # Search
     # ------------------------------------------------------------------
 
     async def _apply_sponsorship_filter(self, page: Page) -> None:
-        """Try to activate Handshake's built-in visa sponsorship filter."""
         try:
-            # Handshake may render a "Visa Sponsorship" checkbox in the filters panel
-            sponsorship_checkbox = page.locator(
+            cb = page.locator(
                 'label:has-text("Visa Sponsorship"), '
                 'label:has-text("visa sponsorship"), '
                 '[data-hook*="sponsorship"], '
                 'input[value*="sponsorship" i]'
             ).first
-            if await sponsorship_checkbox.is_visible(timeout=3000):
-                await sponsorship_checkbox.click()
+            if await cb.is_visible(timeout=3000):
+                await cb.click()
                 await page.wait_for_timeout(1500)
                 logger.info("Activated Handshake visa sponsorship filter.")
         except Exception:
-            pass  # Filter not found — we'll check descriptions ourselves
+            pass
 
     async def _search_jobs(self, page: Page, keyword: str, location: str) -> list:
         qs = f"query={keyword}&location={location}"
@@ -226,15 +257,12 @@ class HandshakeBot:
                 link_el = await card.query_selector("a[href]")
                 if not link_el:
                     continue
-
                 href = await link_el.get_attribute("href") or ""
                 full_url = f"{HANDSHAKE_BASE}{href}" if href.startswith("/") else href
                 job_id = href.split("/")[-1].split("?")[0]
-
                 lines = [ln.strip() for ln in (await card.inner_text()).splitlines() if ln.strip()]
                 title = lines[0] if lines else "Unknown"
                 company = lines[1] if len(lines) > 1 else "Unknown"
-
                 jobs.append({"id": job_id, "title": title, "company": company, "url": full_url})
             except Exception as exc:
                 logger.debug(f"Error parsing card: {exc}")
@@ -247,7 +275,6 @@ class HandshakeBot:
     # ------------------------------------------------------------------
 
     async def _get_job_description_text(self, page: Page, job_url: str) -> str:
-        """Navigate to the job page and return all visible text."""
         await page.goto(job_url, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
         return await page.locator("body").inner_text()
@@ -257,10 +284,6 @@ class HandshakeBot:
     # ------------------------------------------------------------------
 
     async def _submit_application(self, page: Page, job: dict) -> dict:
-        """
-        Assumes we are already on the job detail page.
-        Clicks Apply and handles Quick Apply if available.
-        """
         result = {
             "job_id": job["id"],
             "title": job["title"],
@@ -284,14 +307,12 @@ class HandshakeBot:
         await apply_btn.click()
         await page.wait_for_timeout(2000)
 
-        # Detect redirect to external company ATS
         if HANDSHAKE_BASE not in page.url:
             result["status"] = "external_redirect"
             result["external_url"] = page.url
             logger.info(f"External ATS for '{job['title']}': {page.url}")
             return result
 
-        # Quick Apply modal
         submit_btn = page.locator(
             'button:has-text("Submit"), button:has-text("Confirm"), '
             'button:has-text("Send Application"), button[type="submit"]'
@@ -310,36 +331,28 @@ class HandshakeBot:
         return result
 
     # ------------------------------------------------------------------
-    # Pre-application checks
+    # Filters
     # ------------------------------------------------------------------
 
     def _blocked_company(self, company: str) -> bool:
-        cl = company.lower()
-        return any(bl in cl for bl in self.company_blocklist)
+        return any(bl in company.lower() for bl in self.company_blocklist)
 
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
     async def run(self) -> list:
-        # Default Chrome profile path on Windows; override via config if needed
-        default_profile = os.path.join(
-            os.environ.get("LOCALAPPDATA", ""),
-            "Google", "Chrome", "User Data"
-        )
-        chrome_profile = self.config.get("settings", {}).get(
-            "chrome_profile_path", default_profile
-        )
-
         async with async_playwright() as pw:
-            # Launch Chrome using the user's real profile so Handshake sees
-            # a genuine browser with existing cookies and history.
-            # Chrome must be fully closed before running this script.
-            context = await pw.chromium.launch_persistent_context(
-                user_data_dir=chrome_profile,
-                channel="chrome",
+            browser = await pw.chromium.launch(
                 headless=False,
-                args=["--profile-directory=Default"],
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
                 viewport={"width": 1280, "height": 800},
             )
             await context.add_init_script(
@@ -351,11 +364,9 @@ class HandshakeBot:
                 await self._login(page)
 
                 sent = 0
-
                 for keyword in self.job_keywords:
                     if sent >= self.max_applications:
                         break
-
                     for location in self.locations:
                         if sent >= self.max_applications:
                             break
@@ -365,16 +376,13 @@ class HandshakeBot:
                         for job in jobs:
                             if sent >= self.max_applications:
                                 break
-
                             if self.tracker.has_applied(job["id"]):
                                 logger.info(f"Already applied — skipping '{job['title']}'")
                                 continue
-
                             if self._blocked_company(job["company"]):
-                                logger.info(f"Blocklisted company — skipping '{job['company']}'")
+                                logger.info(f"Blocklisted — skipping '{job['company']}'")
                                 continue
 
-                            # Load job page and check visa sponsorship in description
                             body_text = await self._get_job_description_text(page, job["url"])
                             sponsored, reason = _check_sponsorship_in_text(body_text)
 
@@ -399,9 +407,8 @@ class HandshakeBot:
                                 continue
 
                             if sponsored is None:
-                                logger.info(f"Sponsorship not mentioned — proceeding with '{job['title']}'")
+                                logger.info(f"Sponsorship not mentioned — proceeding: '{job['title']}'")
 
-                            # Apply (we're already on the job page from the sponsorship check)
                             result = await self._submit_application(page, job)
                             result["sponsorship_check"] = reason
                             self.session_results.append(result)
@@ -413,7 +420,7 @@ class HandshakeBot:
                             await asyncio.sleep(self.delay)
 
             finally:
-                await context.close()
+                await browser.close()
 
         applied = sum(1 for r in self.session_results if r["status"] == "applied")
         skipped = sum(1 for r in self.session_results if r["status"].startswith("skipped"))
