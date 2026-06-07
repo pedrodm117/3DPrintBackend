@@ -16,7 +16,7 @@ CONFIG_FILE = Path("handshake_config.json")
 SESSION_FILE = Path("handshake_session.json")
 
 HANDSHAKE_BASE = "https://app.joinhandshake.com"
-LOGIN_URL = f"{HANDSHAKE_BASE}/stu/users/sign_in"
+LOGIN_URL = f"{HANDSHAKE_BASE}/access"
 JOBS_URL = f"{HANDSHAKE_BASE}/stu/jobs"
 
 # Phrases that confirm visa sponsorship is offered
@@ -188,27 +188,23 @@ class HandshakeBot:
         print("  1. Submit your email (already filled in)")
         print("  2. Complete your university SSO")
         print("  3. Approve the Duo Mobile 2FA request")
-        print("  The bot will continue automatically once you land")
-        print("  back on Handshake. It will NOT touch the page.")
+        print("  The bot will wait here — it will NOT touch the page.")
         print("=" * 55 + "\n")
 
-        # Do nothing until the page shows a logged-in Handshake state.
-        # Checks both the URL (/stu/ path, no sign_in) and that the jobs
-        # nav link exists — this is only true after a fully completed login.
-        try:
-            await page.wait_for_function(
-                """() => {
-                    const url = window.location.href;
-                    const loggedIn = url.includes('app.joinhandshake.com/stu') &&
-                                     !url.includes('sign_in') &&
-                                     !url.includes('/users/') &&
-                                     !url.includes('/login');
-                    const hasNav = document.querySelector('a[href*="/stu/jobs"]') !== null;
-                    return loggedIn && hasNav;
-                }""",
-                timeout=300_000,  # 5-minute window for SSO + Duo
-            )
-        except Exception:
+        # Passively poll the URL from Python every 3 seconds.
+        # No JavaScript is injected into the page during this wait.
+        AUTH_PATHS = {"access", "sign_in", "login", "users", "sso", "auth"}
+        deadline = asyncio.get_event_loop().time() + 300  # 5-minute window
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(3)
+            try:
+                url = page.url
+                path = url.replace(HANDSHAKE_BASE, "").lstrip("/").split("/")[0]
+                if HANDSHAKE_BASE in url and path not in AUTH_PATHS and path != "":
+                    break
+            except Exception:
+                continue
+        else:
             raise RuntimeError(
                 "Timed out waiting for login (5 minutes). Please try again."
             )
